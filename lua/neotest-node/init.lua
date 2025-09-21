@@ -2,10 +2,22 @@ local async = require("neotest.async")
 local lib = require("neotest.lib")
 
 ---@class neotest.Adapter
+---@field name string
 local adapter = { name = "neotest-node" }
 
+---Find the project root directory given a current directory to work from.
+---Should no root be found, the adapter can still be used in a non-project context if a test file matches.
+---@async
+---@param path string @Directory to treat as cwd
+---@return string | nil @Absolute root dir of test suite
 function adapter.root(path) return lib.files.match_root_pattern("package.json")(path) end
 
+---Filter directories when searching for test files
+---@async
+---@param name string Name of directory
+---@param _relpath string Path to directory, relative to root
+---@param _root string Root directory of project
+---@return boolean
 function adapter.filter_dir(name, _relpath, _root) return name ~= "node_modules" end
 
 ---@param file_path? string
@@ -24,36 +36,38 @@ function adapter.is_test_file(file_path)
     for _, ext in ipairs({ "js", "jsx", "coffee", "ts", "tsx" }) do
       if string.match(file_path, "%." .. x .. "%." .. ext .. "$") then
         is_test_file = true
-        goto matched_pattern
+        break
       end
     end
   end
-  ::matched_pattern::
+
   return is_test_file
 end
 
+---Given a file path, parse all the tests within it.
 ---@async
+---@param file_path string Absolute file path
 ---@return neotest.Tree | nil
-function adapter.discover_positions(path)
+function adapter.discover_positions(file_path)
   local query = [[
     ; -- Namespaces --
-    ; Matches: `describe('context')`
+    ; Matches: `describe('context') / suite('context')`
     ((call_expression
-      function: (identifier) @func_name (#eq? @func_name "describe")
+      function: (identifier) @func_name (#any-of? @func_name "describe" "suite")
       arguments: (arguments (string (string_fragment) @namespace.name) (arrow_function))
     )) @namespace.definition
-    ; Matches: `describe.only('context')`
+    ; Matches: `describe.only('context') / suite.only('context')`
     ((call_expression
       function: (member_expression
-        object: (identifier) @func_name (#any-of? @func_name "describe")
+        object: (identifier) @func_name (#any-of? @func_name "describe" "suite")
       )
       arguments: (arguments (string (string_fragment) @namespace.name) (arrow_function))
     )) @namespace.definition
-    ; Matches: `describe.each(['data'])('context')`
+    ; Matches: `describe.each(['data'])('context') / suite.each(['data'])('context')`
     ((call_expression
       function: (call_expression
         function: (member_expression
-          object: (identifier) @func_name (#any-of? @func_name "describe")
+          object: (identifier) @func_name (#any-of? @func_name "describe" "suite")
         )
       )
       arguments: (arguments (string (string_fragment) @namespace.name) (arrow_function))
@@ -83,20 +97,29 @@ function adapter.discover_positions(path)
     )) @test.definition
   ]]
   query = query .. string.gsub(query, "arrow_function", "function_expression")
-  return lib.treesitter.parse_positions(path, query, { nested_tests = true })
+  return lib.treesitter.parse_positions(file_path, query, { nested_tests = true })
 end
 
 ---@param args neotest.RunArgs
----@return neotest.RunSpec | nil
+---@return nil | neotest.RunSpec | neotest.RunSpec[]
 function adapter.build_spec(args)
   local file_path = args.tree:data().path
+  local type = args.tree:data().type
 
   local command = {
     "node",
     "--test",
     "--test-reporter=tap",
-    file_path,
+    "--experimental-strip-types",
+    "--experimental-transform-types",
+    "--no-warnings=ExperimentalWarning",
   }
+
+  if type == "test" then
+    table.insert(command, "--test-name-pattern=" .. args.tree:data().name)
+  end
+
+  table.insert(command, file_path)
 
   return {
     command = command,
@@ -107,8 +130,10 @@ end
 
 ---@async
 ---@param spec neotest.RunSpec
----@return neotest.Result[]
-function adapter.results(spec, result_output, tree)
+---@param result_output neotest.StrategyResult
+---@param _tree neotest.Tree
+---@return table<string, neotest.Result>
+function adapter.results(spec, result_output, _tree)
   if not type(result_output) == "table" or not result_output.output then
     vim.notify("Unknown result_output structure: " .. vim.inspect(result_output), vim.log.levels.ERROR)
     return {}
@@ -156,7 +181,7 @@ function adapter.results(spec, result_output, tree)
           local test_result_level = #test_indent / 4 + 1
 
           local full_context = table.concat(context_stack, "::", 1, test_result_level)
-          local test_key = spec.context.id .. "::" .. full_context
+          local test_key = spec.context.id
           results[test_key] = {
             status = status,
             short = test_name .. ": " .. test_status,
